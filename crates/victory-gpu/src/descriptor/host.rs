@@ -583,18 +583,20 @@ impl HostHeap {
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
+                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS;
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = wanted.min(most),
+                    lost = wanted.saturating_sub(most),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    // Never more title slots than were asked for.
+                    wanted.min(most),
                     DYNAMIC_CAPPED,
                 )
             }
