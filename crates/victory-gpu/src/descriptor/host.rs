@@ -8,7 +8,7 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -38,11 +38,13 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
     /// Where the next search starts, the slots taken, and the smallest run
     /// known not to be free since the last release (`usize::MAX`: none).
     next: Mutex<(u32, Vec<bool>, usize)>,
+    /// Free dynamic slots remaining in this heap, for lock-free capacity checks.
+    free: AtomicU32,
+    /// Frame index and consecutive failed full walks since the last release or frame.
+    failed_walks: [AtomicU64; 2],
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -651,6 +653,8 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
+            free: AtomicU32::new(extra),
+            failed_walks: [AtomicU64::new(0), AtomicU64::new(0)],
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -751,6 +755,31 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Finds the first contiguous run of `n` free dynamic slots in next-fit order.
+/// A free run that starts before `cursor` can end after it, up to `n - 1` slots
+/// beyond, while runs still never wrap across the physical end of the array.
+fn find_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    if n == 0 || n > taken.len() {
+        return None;
+    }
+    let cursor = cursor.min(taken.len());
+    let second_end = if cursor == 0 {
+        0
+    } else {
+        cursor.saturating_add(n - 1).min(taken.len())
+    };
+    for (base, slice) in [(cursor, &taken[cursor..]), (0, &taken[..second_end])] {
+        let mut run = 0;
+        for (offset, &used) in slice.iter().enumerate() {
+            run = if used { 0 } else { run + 1 };
+            if run == n {
+                return Some(base + offset + 1 - n);
+            }
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// The microseconds of slot making (`which`: 0 plans, 1 recording) left.
     fn budget_left(&self, which: usize) -> u64 {
@@ -785,53 +814,48 @@ impl HostHeap {
             });
             return None;
         }
+        if self.free.load(Ordering::Acquire) < n {
+            return None;
+        }
         let spare = self.spare as usize;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken, no_run) = &mut *guard;
+        let n_u32 = n;
         let n = n as usize;
-        // A search that found no run of this size (or of a smaller one)
+        // A search that found no run of this size (or of a larger one)
         // since the last release finds none now: without this, each table
         // of a frame that does not fit walked all the slots again, and a
         // heavy place took 7 to 11 seconds a frame (runs sw1, sw2).
         if n >= *no_run {
             return None;
         }
-        // Releases come all the time and each allows a search again: no
-        // more than a few failed walks a frame.
-        static FAILED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        // Cap consecutive failed walks per heap per frame (reset on release)
+        // so fragmented misses in one heap do not starve other heaps or
+        // allocations after slots are released.
         const WALKS: u64 = 8;
         let frame = crate::queue::presented();
-        if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
-            FAILED[1].store(0, Ordering::Relaxed);
+        if self.failed_walks[0].swap(frame, Ordering::Relaxed) != frame {
+            self.failed_walks[1].store(0, Ordering::Relaxed);
         }
-        if FAILED[1].load(Ordering::Relaxed) >= WALKS {
+        if self.failed_walks[1].load(Ordering::Relaxed) >= WALKS {
             return None;
         }
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = find_dynamic_run(taken, *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    spare,
+                    "no free dynamic descriptor slots: a table is not made"
+                )
+            });
             *no_run = n;
-            FAILED[1].fetch_add(1, Ordering::Relaxed);
+            self.failed_walks[1].fetch_add(1, Ordering::Relaxed);
             return None;
         };
         taken[first..first + n].fill(true);
+        self.free.fetch_sub(n_u32, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
@@ -862,9 +886,19 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+            let mut freed = 0u32;
+            for slot in slots {
+                if *slot {
+                    *slot = false;
+                    freed += 1;
+                }
+            }
+            if freed > 0 {
+                self.free.fetch_add(freed, Ordering::Release);
+                guard.2 = usize::MAX;
+                self.failed_walks[1].store(0, Ordering::Relaxed);
+            }
         }
-        guard.2 = usize::MAX;
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3024,6 +3058,70 @@ void main() {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
+    }
+
+    #[test]
+    fn find_dynamic_run_scans_contiguous_runs_across_cursor_but_not_end() {
+        let mut taken = vec![true; 16];
+        // Free slots 10..14 straddle cursor = 12.
+        taken[10..14].fill(false);
+        assert_eq!(find_dynamic_run(&taken, 12, 4), Some(10));
+        assert_eq!(find_dynamic_run(&taken, 12, 5), None);
+
+        // Two free slots at the end and two at the start are not contiguous.
+        let mut split = vec![true; 16];
+        split[14..16].fill(false);
+        split[0..2].fill(false);
+        assert_eq!(find_dynamic_run(&split, 8, 4), None);
+        assert_eq!(find_dynamic_run(&split, 8, 2), Some(14));
+    }
+
+    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let a = heap.dynamic(8).unwrap();
+        let b = heap.dynamic(8).unwrap();
+        assert_eq!((a, b), (4, 12));
+        let rest = heap.spare - 16;
+        assert_eq!(heap.dynamic(rest), Some(20));
+        heap.release(4, 12);
+        assert_eq!(heap.dynamic(12), Some(4));
+
+        // Release dynamic slots 10..14 (heap slots 14..18, crossing cursor at 12).
+        heap.release(14, 4);
+        assert_eq!(heap.dynamic(4), Some(14));
+    }
+
+    #[test]
+    fn failed_dynamic_walks_do_not_starve_other_heaps_and_reset_on_release() {
+        let (Some(view_heap), Some(sampler_heap)) =
+            (HostHeap::new(false, 4), HostHeap::new(true, 4 * SAMPLERS))
+        else {
+            return; // no host GPU
+        };
+        let half = view_heap.spare / 2;
+        let first = view_heap.dynamic(half).unwrap();
+        let second = view_heap.dynamic(view_heap.spare - half).unwrap();
+        // Free 10 isolated 1-slot gaps (max contiguous run = 1, total free = 10).
+        for i in 0..10 {
+            view_heap.release(first + i * 2, 1);
+        }
+        // Misses in decreasing sizes (10 through 2) hit
+        // the per-heap WALKS cap of 8 without affecting the other heap.
+        for size in (2..=10).rev() {
+            assert_eq!(view_heap.dynamic(size), None);
+        }
+        assert_eq!(view_heap.failed_walks[1].load(Ordering::Relaxed), 8);
+        assert_eq!(
+            sampler_heap.dynamic(SAMPLER_DYNAMIC),
+            Some(SAMPLERS - SAMPLER_DYNAMIC)
+        );
+        // Releasing a contiguous run clears this heap's failed-walk lockout.
+        view_heap.release(second, 4);
+        assert_eq!(view_heap.dynamic(4), Some(second));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
