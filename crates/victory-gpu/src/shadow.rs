@@ -1936,10 +1936,10 @@ impl Shadow {
         None
     }
 
-    /// The CPU's views of each tile's part of `[from, to)`: its title
-    /// address, the view, its length. Tiles already mapped are found under
-    /// one lock (the world declares ~160 GB of ranges a frame: one lock per
-    /// 64 KiB tile was a tenth of the submitting thread's time).
+    /// The CPU's views of each tile's part of `[from, to)`: its title address,
+    /// the tile's mapped base, and the length. Tiles already mapped are found
+    /// under one lock (the world declares ~160 GB of ranges a frame: one lock
+    /// per 64 KiB tile was a tenth of the submitting thread's time).
     fn tiles_of(&self, s: &Sparse, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
         let start = self.start as usize;
         let mut views = Vec::with_capacity((to - from).div_ceil(PAGE) + 1);
@@ -1953,7 +1953,7 @@ impl Shadow {
                 match tiles.get_mut(&(((at - start) / PAGE) as u32)) {
                     Some(t) => {
                         t.used = frame;
-                        views.push((at, t.data + at % PAGE, n));
+                        views.push((at, t.data, n));
                     }
                     None => missing.push((at, n)),
                 }
@@ -1962,7 +1962,7 @@ impl Shadow {
         }
         for (at, n) in missing {
             if let Some(data) = self.tile(s, at) {
-                views.push((at, data + at % PAGE, n));
+                views.push((at, data, n));
             }
         }
         views
@@ -1990,7 +1990,7 @@ impl Shadow {
         // (tile, the start of its view) of tiles without a snapshot yet.
         let new: Vec<(u32, usize)> = views
             .iter()
-            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
+            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data))
             .filter(|(tile, _)| !before.contains_key(tile))
             .collect();
         if new.is_empty() {
@@ -2026,16 +2026,17 @@ impl Shadow {
             .iter()
             .filter_map(|&(at, data, n)| {
                 let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
-                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+                let offset = at % PAGE;
+                Some((at, data + offset, n, old.as_mut_ptr() as usize + offset))
             })
             .collect();
         let written = std::sync::atomic::AtomicUsize::new(0);
         crate::host::in_parallel(&work, 8, |chunk| {
             let mut title: Option<Vec<u8>> = None;
             for &(at, data, n, old) in chunk {
-                // SAFETY: the tile's mapping and its snapshot (kept under the
-                // lock held above); this tile is this thread's alone.
+                // SAFETY: this thread has exclusive access to this part of the mapped tile.
                 let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                // SAFETY: the snapshot is kept under the lock held above and belongs to this tile.
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
