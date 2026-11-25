@@ -661,29 +661,6 @@ static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
 #[cfg(test)]
-pub(crate) fn test_queue() -> (This, usize) {
-    let desc = QueueDesc {
-        kind: 0,
-        priority: 0,
-        flags: 0,
-        nodes: 0,
-    };
-    let mut q = std::ptr::null();
-    assert_eq!(
-        create(std::ptr::null(), &desc, &QUEUE_IIDS[0], &mut q),
-        S_OK
-    );
-    // SAFETY: one of our queues; its first field is the table.
-    let table = unsafe { *q.cast::<*const *const ()>() };
-    let signal_slot = if table == NEWER_FUNCTIONS.0.as_ptr() {
-        0x80
-    } else {
-        0x70
-    };
-    (q, signal_slot)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;

@@ -454,7 +454,9 @@ pub(crate) mod flips {
         first: u64,
         last: u64,
     }
+    #[allow(clippy::type_complexity)]
     static SEEN: Mutex<Option<HashMap<(usize, [u32; 4]), Seen>>> = Mutex::new(None);
+    #[allow(clippy::type_complexity)]
     /// The views made of placed textures, by address.
     pub(crate) static VIEWS: Mutex<std::collections::BTreeMap<u64, Vec<([u32; 14], [u32; 16])>>> =
         Mutex::new(std::collections::BTreeMap::new());
