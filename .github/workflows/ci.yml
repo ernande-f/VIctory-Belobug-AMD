@@ -30,6 +30,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1 --nocapture
       - name: Build diagnostics executable
+        if: ${{ !cancelled() }}
         run: cargo build --profile diag --package victory --features diagnostics --locked
