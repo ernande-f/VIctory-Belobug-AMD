@@ -1,11 +1,11 @@
 //! Console wave64 compute programs on hosts with and without 64-lane waves:
 //! hand-assembled GFX10 code, dispatched on every hardware adapter, checked
-//! lane by lane against what the console's lane layout gives. On a host
-//! without 64-lane waves, programs whose lanes read only their own 32-lane
-//! half run as two host waves of 32 (see `lower::Lower::new`).
+//! lane by lane against what the console's lane layout gives. On a 32-lane
+//! host, programs whose lanes read only their own 32-lane half run as two
+//! host waves of 32 (see `lower::Lower::new`).
 
 use super::host::{Dispatch, Host, Root, View, adapters};
-use super::tests::{compute, emit_for};
+use super::tests::{compute, emit_for, lane_fixture_can_run};
 use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -103,7 +103,7 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
         eprintln!("no DXGI; skipped");
         return;
     };
-    let mut ran = 0;
+    let mut checked = 0;
     for name in names {
         let Ok(host) = Host::on(&name) else {
             eprintln!("{name}: no SM 6.6 device; skipped");
@@ -114,6 +114,9 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
         // has its lower half only.
         for threads in [64, 128, 32] {
             let p = program(IN_HALF, threads);
+            if !lane_fixture_can_run(&p, target, &name) {
+                continue;
+            }
             let cs = emit_for(&p, target).unwrap_or_else(|e| panic!("{name}: {e}"));
             let split = !target.runs(64);
             assert_eq!(
@@ -129,9 +132,9 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
             assert_eq!(out, want, "{name}: {threads} threads (split {split})");
             eprintln!("{name}: {threads} threads per group exact (split {split})");
         }
-        ran += 1;
+        checked += 1;
     }
-    if ran == 0 {
+    if checked == 0 {
         eprintln!("no hardware adapter; skipped");
     }
 }
@@ -181,7 +184,8 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
-        let split = !host.target().runs(64);
+        let target = host.target();
+        let split = !target.runs(64);
         for threads in [
             [4, 4, 4],
             [8, 8, 2],
@@ -191,6 +195,9 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
             [4, 8, 8],
         ] {
             let p = program_3d(threads);
+            if !lane_fixture_can_run(&p, target, &name) {
+                continue;
+            }
             let n: u32 = threads.iter().product();
             let out = run(&host, &p, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
             let want: Vec<u32> = (0..n).map(|f| f ^ 31).collect();
@@ -201,8 +208,8 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
 }
 
 /// Runs `body` (v0 = t in, v2 out) on every hardware adapter in groups of
-/// `threads` and checks lane t against `want(t)`; on a host without
-/// 64-lane waves it must have translated in the console flow.
+/// `threads` and checks lane t against `want(t)`. On a 32-lane host the
+/// program must have translated in the console flow.
 fn console_flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32) {
     flow_case(label, body, threads, want, true);
 }
@@ -219,7 +226,11 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
             continue;
         };
         let p = program(body, threads);
-        let split = !host.target().runs(64);
+        let target = host.target();
+        if !lane_fixture_can_run(&p, target, &name) {
+            continue;
+        }
+        let split = !target.runs(64);
         let groups = 2;
         let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
         let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();

@@ -994,12 +994,14 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        let (baseline, before) = writes(start, end, false).expect("watched");
+        // The journal can still hold writes from an earlier allocation at this address.
+        assert!(before.iter().all(|&(_, written)| written < baseline));
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let new: Vec<_> = after.into_iter().filter(|&(_, written)| written == now).collect();
+        assert_eq!(new, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);

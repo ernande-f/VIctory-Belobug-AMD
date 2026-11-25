@@ -1071,6 +1071,34 @@ mod tests {
         super::emit(&c, native, &p, &st, &io, &res, target)
     }
 
+    /// A fixture may still translate without a fixed width. On a target
+    /// offering neither the console width nor the split-wave form, check
+    /// the reason for a refusal and keep testing any shader that emits.
+    pub(super) fn lane_fixture_can_run(
+        program: &crate::NativeProgram,
+        target: Target,
+        adapter: &str,
+    ) -> bool {
+        if target.runs(32) || (program.wave64 && target.runs(64)) {
+            return true;
+        }
+        let Err(error) = emit_for(program, target) else {
+            return true;
+        };
+        let what = if program.wave64 {
+            "console wave64 lanes on a host without 64-lane waves"
+        } else {
+            "a console wave size the host does not run"
+        };
+        assert_eq!(
+            error,
+            crate::ShaderError::Unsupported { offset: 0, what },
+            "{adapter}"
+        );
+        eprintln!("{adapter}: expected translation refusal: {what}");
+        false
+    }
+
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
@@ -1107,6 +1135,13 @@ mod tests {
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
         assert!(emit_for(&wave32, RDNA).is_ok());
+        let wave16 = Target {
+            lanes_min: 16,
+            lanes_max: 16,
+        };
+        // This wave32 fixture can emit without a fixed width.
+        assert!(lane_fixture_can_run(&wave32, wave16, "wave16"));
+        assert!(!lane_fixture_can_run(&wave64, wave16, "wave16"));
     }
 
     #[test]
@@ -1138,10 +1173,9 @@ mod tests {
     }
 
     /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// translates in groups of one console wave on 32- or 64-lane hardware.
+    /// In groups of two it requires native 64-lane waves. Check the refusal
+    /// as well as the pipelines the adapter can run.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1157,10 +1191,12 @@ mod tests {
             };
             let target = host.target();
             eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
-            let one =
-                emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
-            host.compute_pipeline(&one)
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let one = compute(&words, true);
+            if lane_fixture_can_run(&one, target, &name) {
+                let shader = emit_for(&one, target).unwrap_or_else(|e| panic!("{name}: {e}"));
+                host.compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
             match emit_for(&compute_of(&words, true, 128), target) {
                 Ok(cs) => {
                     assert!(target.runs(64), "{name}");

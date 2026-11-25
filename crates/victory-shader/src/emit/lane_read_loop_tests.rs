@@ -14,6 +14,7 @@
 //! every hardware adapter; each wrong lane is listed.
 
 use super::host::{Dispatch, Host, Root, View, adapters};
+use super::tests::lane_fixture_can_run;
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
 
 /// The program for waves of `wave` lanes, one wave per group, reading
@@ -107,7 +108,11 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
             let Ok(host) = Host::on(name) else { continue };
             // For the host's waves: a wave64 program runs in two halves
             // where there are no 64-lane waves.
-            let cs = emit(&program, host.target());
+            let target = host.target();
+            if !lane_fixture_can_run(&program, target, name) {
+                continue;
+            }
+            let cs = emit(&program, target);
             let (root, pso) = host
                 .compute_pipeline(&cs)
                 .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
