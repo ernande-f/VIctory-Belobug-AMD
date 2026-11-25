@@ -561,6 +561,14 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
+    /// Values an instruction or phi reads as data, found once for
+    /// [`Lower::read_as_data`] (every descriptor load asks, and the program is
+    /// long).
+    data_reads: std::cell::OnceCell<HashSet<Value>>,
+    /// The loaded sources among the descriptors' leaves, found once for the
+    /// same reason: the descriptor's role, its access, the load, the load's
+    /// first dword.
+    loaded_leaves: std::cell::OnceCell<Vec<(Role, Site, Site, u8)>>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -1350,6 +1358,8 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            data_reads: Default::default(),
+            loaded_leaves: Default::default(),
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -5020,11 +5030,11 @@ impl<'a> Lower<'a> {
             return true;
         }
         let first_lane_of = |v: Value| {
-            self.x
-                .p
-                .blocks
+            // A value is written once, so only its block can hold the write.
+            let b = *self.def_block.get(&v)?;
+            self.x.p.blocks[b]
+                .insts
                 .iter()
-                .flat_map(|b| &b.insts)
                 .find(|i| i.writes.iter().any(|w| w.1 == v))
                 .filter(|i| i.name() == "v_readfirstlane_b32")
                 .and_then(|i| {
@@ -5073,40 +5083,29 @@ impl<'a> Lower<'a> {
         // vector uses, since those carry format and indexing cues.
         let find = |own: bool| {
             let mut best = None;
-            for d in self
-                .x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-            {
-                for l in d.source.leaves() {
-                    let Source::Loaded { load, first } = *l else {
-                        continue;
-                    };
-                    if (load == site) != own {
-                        continue;
-                    }
-                    // A twin load of the same dwords (a non-uniform index
-                    // reloads the descriptor in each waterfall loop, one for
-                    // the size bits, another for the access) is at skew 0.
-                    let Some(skew) = self
-                        .load_skew(inst, site, load)
-                        .or_else(|| (!own && self.twin_loads(site, load)).then_some(0))
-                        .map(|s| s - i32::from(first))
-                    else {
-                        continue;
-                    };
-                    if !own && !(0..8).contains(&skew) {
-                        continue;
-                    }
-                    let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
-                    let found = (d.site, load, first, skew);
-                    if matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. }) {
-                        return Some(found);
-                    }
-                    best.get_or_insert(found);
+            for &(role, at, load, first) in self.loaded_leaves() {
+                if role != Role::Resource || (load == site) != own {
+                    continue;
                 }
+                // A twin load of the same dwords (a non-uniform index
+                // reloads the descriptor in each waterfall loop, one for
+                // the size bits, another for the access) is at skew 0.
+                let Some(skew) = self
+                    .load_skew(inst, site, load)
+                    .or_else(|| (!own && self.twin_loads(site, load)).then_some(0))
+                    .map(|s| s - i32::from(first))
+                else {
+                    continue;
+                };
+                if !own && !(0..8).contains(&skew) {
+                    continue;
+                }
+                let ui = &self.x.p.blocks[at.0].insts[at.1];
+                let found = (at, load, first, skew);
+                if matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. }) {
+                    return Some(found);
+                }
+                best.get_or_insert(found);
             }
             best
         };
@@ -5402,14 +5401,39 @@ impl<'a> Lower<'a> {
     /// Whether an instruction or phi reads `v` other than as a resource
     /// operand of a memory instruction (which takes the descriptor whole).
     fn read_as_data(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    !matches!(
-                        i.fields,
-                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
-                    ) && i.reads.iter().any(|r| r.1 == v)
-                })
+        self.data_reads
+            .get_or_init(|| {
+                let mut read = HashSet::with_capacity(self.def_block.len());
+                for b in &self.x.p.blocks {
+                    for p in &b.phis {
+                        read.extend(p.args.iter().copied());
+                    }
+                    for i in &b.insts {
+                        if !matches!(
+                            i.fields,
+                            Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+                        ) {
+                            read.extend(i.reads.iter().map(|r| r.1));
+                        }
+                    }
+                }
+                read
+            })
+            .contains(&v)
+    }
+
+    /// The loaded sources among every descriptor's leaves, in order.
+    fn loaded_leaves(&self) -> &[(Role, Site, Site, u8)] {
+        self.loaded_leaves.get_or_init(|| {
+            let mut loaded = Vec::new();
+            for d in &self.x.res.descriptors {
+                for l in d.source.leaves() {
+                    if let Source::Loaded { load, first } = *l {
+                        loaded.push((d.role, d.site, load, first));
+                    }
+                }
+            }
+            loaded
         })
     }
 
@@ -8893,8 +8917,9 @@ impl<'a> Lower<'a> {
     /// A dword a scalar load writes, where the load is a descriptor the
     /// program uses as a resource or sampler.
     fn descriptor_dword(&self, v: Value) -> bool {
-        let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
-            block
+        // A value is written once, so only its block can hold the load.
+        let Some(load) = self.def_block.get(&v).and_then(|&b| {
+            self.x.p.blocks[b]
                 .insts
                 .iter()
                 .position(|i| i.writes.iter().any(|w| w.1 == v))
@@ -8905,12 +8930,7 @@ impl<'a> Lower<'a> {
         self.x.p.blocks[load.0].insts[load.1]
             .name()
             .starts_with("s_load_dword")
-            && self.x.res.descriptors.iter().any(|d| {
-                d.source
-                    .leaves()
-                    .iter()
-                    .any(|l| matches!(l, Source::Loaded { load: at, .. } if *at == load))
-            })
+            && self.loaded_leaves().iter().any(|l| l.2 == load)
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
