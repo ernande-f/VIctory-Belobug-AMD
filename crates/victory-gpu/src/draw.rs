@@ -104,6 +104,7 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    #[allow(clippy::type_complexity)]
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
     large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,

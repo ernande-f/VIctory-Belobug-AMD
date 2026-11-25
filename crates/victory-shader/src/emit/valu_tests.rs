@@ -1422,6 +1422,20 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
     })
 }
 
+/// A host that runs the console's 64-lane waves, which [`build_lanes_cs`]
+/// translates for; `None`, saying why, on any other.
+fn wave64_host() -> Option<Host> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    if !host.target().runs(64) {
+        eprintln!("SKIPPED (no wave64): the host does not run 64-lane waves");
+        return None;
+    }
+    Some(host)
+}
+
 /// A divergent loop's exit mask (lanes that left in earlier iterations, so
 /// not running where it is last written) read as a number after the loop.
 #[test]
@@ -1440,8 +1454,7 @@ fn loop_exit_mask_counted_after_the_loop() {
         0x7E00_0204, // v_mov_b32 v0, s4
     ];
     let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; skipped");
+    let Some(host) = wave64_host() else {
         return;
     };
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -1485,7 +1498,9 @@ fn scalar_counted_in_a_divergent_loop_read_after_it() {
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
     let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let host = Host::new(false).unwrap();
+    let Some(host) = wave64_host() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -1522,7 +1537,9 @@ fn mask_grown_inside_a_branch_counted_after_it() {
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
     let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let host = Host::new(false).unwrap();
+    let Some(host) = wave64_host() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -1572,7 +1589,9 @@ fn scalar_counted_in_nested_divergent_loops() {
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
     let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
-    let host = Host::new(false).unwrap();
+    let Some(host) = wave64_host() else {
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host

@@ -1,5 +1,5 @@
 //! Hand-encoded GFX10 compute programs, with a raw UAV for readback.
-use super::{Container, HostShader, emit};
+use super::{Container, HostShader, Target, emit};
 use crate::gfx10::{Encoding, Fields, NULL, Operand};
 use crate::native::{
     ComputeIo, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -25,15 +25,12 @@ fn mov(body: &mut Vec<u32>, reg: u32, value: u32) {
     body.extend([0x7E00_02FF | reg << 17, value]); // v_mov_b32 with a literal
 }
 
-fn shader(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
-    shader_with(body, threads, None, 0)
-}
-
 fn shader_with(
     body: &[u32],
     threads: u32,
     root_view: Option<ResourceType>,
     stride: u32,
+    target: Target,
 ) -> Result<HostShader, ShaderError> {
     let mut words = vec![
         0xBE85_0380u32, // s_mov_b32 s5, 0
@@ -114,18 +111,24 @@ fn shader_with(
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
     let empty = super::container::build(&[]);
-    emit(&Container::parse(&empty)?, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
+    emit(&Container::parse(&empty)?, &native, &p, &st, &io, &res, target)
 }
 
 #[cfg(windows)]
 fn check(body: &[u32], expected: &[u32], wide_lds: bool, wide_heap: bool) {
-    let shader = shader(body, 1).expect("translate synthetic memory program");
-    check_shader(shader, expected, wide_lds, wide_heap, None, None);
+    check_shader(
+        |target| shader_with(body, 1, None, 0, target),
+        expected,
+        wide_lds,
+        wide_heap,
+        None,
+        None,
+    );
 }
 
 #[cfg(windows)]
 fn check_shader(
-    mut shader: HostShader,
+    build: impl Fn(Target) -> Result<HostShader, ShaderError>,
     expected: &[u32],
     wide_lds: bool,
     wide_heap: bool,
@@ -135,10 +138,11 @@ fn check_shader(
     use super::host::{Dispatch, Host, Root, View};
     use windows::Win32::Graphics::Direct3D12::*;
 
+    let mut shader = build(Target::ANY).expect("translate synthetic memory program");
     let path = super::validator::Validator::default_path();
     if let Ok(mut validator) = super::validator::Validator::load(path.as_deref()) {
         validator
-            .validate(&mut shader.dxil)
+            .validate(&mut shader.dxil.clone())
             .expect("validate memory DXIL");
     } else {
         eprintln!("no dxil.dll; skipped validation");
@@ -147,6 +151,20 @@ fn check_shader(
         eprintln!("no SM 6.6 device; skipped dispatch");
         return;
     };
+    let target = host.target();
+    if !target.runs(32) {
+        match build(target) {
+            Ok(for_host) => shader = for_host,
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a console wave size the host does not run",
+            }) => {
+                eprintln!("host does not support the shader's wave32 requirement; skipped dispatch");
+                return;
+            }
+            Err(error) => panic!("translate memory shader for host: {error}"),
+        }
+    }
     let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
     let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
     // SAFETY: the out pointers and sizes match the queried feature structs.
@@ -597,8 +615,14 @@ fn buffer_64_bit_atomics() {
 fn buffer_concurrent_byte_stores() {
     // Each lane writes its index to a different byte of one output dword.
     let body = buf(0x18, 2048, 0, 1 << 12);
-    let shader = shader(&body, 4).unwrap();
-    check_shader(shader, &[0x0302_0100], false, false, None, None);
+    check_shader(
+        |target| shader_with(&body, 4, None, 0, target),
+        &[0x0302_0100],
+        false,
+        false,
+        None,
+        None,
+    );
 }
 
 #[cfg(windows)]
@@ -633,9 +657,8 @@ fn structured_buffer_memory_uses_index_and_member_offset() {
     mov(&mut body, 4, 7);
     body.extend(indexed(0x3C, 0, 4, 1 << 14)); // invalid record never enters the CAS loop
     output(&mut body, &mut expect, 4, 0);
-    let shader = shader_with(&body, 1, None, 8).unwrap();
     check_shader(
-        shader,
+        |target| shader_with(&body, 1, None, 8, target),
         &expect,
         false,
         false,
@@ -710,12 +733,18 @@ fn global_and_scalar_loads_through_root_views() {
         } else {
             expect
         };
-        let shader = shader_with(body, 1, Some(kind), 0).unwrap();
         let root = Root::View {
             srv: kind == ResourceType::Srv,
             data: data.clone(),
         };
-        check_shader(shader, expect, false, false, Some(root), None);
+        check_shader(
+            |target| shader_with(body, 1, Some(kind), 0, target),
+            expect,
+            false,
+            false,
+            Some(root),
+            None,
+        );
     }
 }
 
@@ -855,7 +884,7 @@ fn memory_opcode_refusals() {
                 } else {
                     0
                 };
-                if let Err(err) = shader_with(&body, 1, root, stride) {
+                if let Err(err) = shader_with(&body, 1, root, stride, Target::ANY) {
                     println!("{name:34} {label:8} {err}");
                 }
             }

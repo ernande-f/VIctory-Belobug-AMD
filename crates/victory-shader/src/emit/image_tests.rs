@@ -208,7 +208,7 @@ const CS_DERIVATIVES: &str = "Function uses features incompatible with the shade
 /// `inst`'s program translated, and validated when the validator is found
 /// (`CS_DERIVATIVES` let through for a sample with implicit derivatives).
 fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderError> {
-    let s = lower(&program(inst, literals))?;
+    let s = lower(&program(inst, literals), super::Target::ANY)?;
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
@@ -220,7 +220,7 @@ fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderErr
     Ok(s)
 }
 
-fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
+fn lower(words: &[u32], target: super::Target) -> Result<HostShader, ShaderError> {
     let n = native(words);
     let p = ir::build(&n.code, n.wave64, n.vgprs)?;
     let res = resource::track(&p, &n.layout, n.stage)?;
@@ -228,7 +228,7 @@ fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
     let st = structure::structure(&p)?;
     let bytes = dxbc::build(&[]);
     let c = Container::parse(&bytes)?;
-    emit(&c, &n, &p, &st, &io, &res, crate::emit::Target::ANY)
+    emit(&c, &n, &p, &st, &io, &res, target)
 }
 
 fn host() -> Option<Host> {
@@ -449,7 +449,23 @@ fn check(
     sampler: D3D12_SAMPLER_DESC,
 ) {
     let mut failures = Vec::new();
+    let target = host.target();
     for c in cases {
+        if c.inst.implicit && !target.runs(32) {
+            translate(c.inst, &c.literals).expect("translate implicit derivative fixture");
+            let error = lower(&program(c.inst, &c.literals), target).err();
+            assert_eq!(
+                error,
+                Some(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a console wave size the host does not run",
+                }),
+                "{}",
+                c.what,
+            );
+            eprintln!("{}: host does not support the wave32 requirement; skipped dispatch", c.what);
+            continue;
+        }
         let addr: Vec<[u32; ADDR]> = c
             .lanes
             .iter()

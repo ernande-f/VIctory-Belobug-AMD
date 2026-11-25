@@ -61,6 +61,7 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     /// It animates or draws hair strands ([`hair_strands`]).
     #[cfg(windows)]
     hair: bool,
