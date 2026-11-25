@@ -52,6 +52,8 @@ Picture:
   glass and skin. Upstream does this after discards only.
 - A helper pixel's `v_readfirstlane` reads its own value (upstream `0601955`).
 - Twice the dynamic descriptor slots, so the tables of heavy frames fit.
+- The dynamic allocator can reuse a contiguous range that crosses its search
+  cursor and retries after a release on that heap.
 - Depth and stencil twins for depth textures written by compute, screen
   passes with pipeline workers of their own, textures told apart by the mips
   their memory really holds, and other fixes listed in the history.
@@ -70,6 +72,8 @@ Speed:
   processor's work, not by the wait.
 - Shader cache entries of another build can be reused
   (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
+- Shader translation reuses its descriptor-load lookups instead of scanning
+  the entire shader for each load.
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of
@@ -132,10 +136,8 @@ The first launch after a build translates every shader and builds about
 - Windows 10 is reported not to get past start-up without a newer D3D12
   runtime (issue #9, pull request #44, not merged or tried here yet); this
   fork has only been run on Windows 11.
-- One test fails on this machine, before and after this update:
-  `list::tests::lists_are_cut_at_waits_that_follow_work`.
-- `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
-  `cargo xtask policy`; it is source code, not an asset.
+- The command-list wait regression test now uses writable atomic storage.
+  Its result on the RX 9070 XT still needs to be checked.
 - Many changes are specific to this title and this GPU, and some are marked
   `shortcut:` in the code where they approximate what the console does.
 

@@ -2069,8 +2069,11 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn lists_are_cut_at_waits_that_follow_work() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         if crate::host::host().is_none() {
             return;
         }
@@ -2078,18 +2081,15 @@ mod tests {
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
         assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
-        let memory = [0u64; 2];
-        let at = |i: usize| (&raw const memory[i]) as u64;
-        let value = |i: usize| {
-            // SAFETY: inside the array.
-            unsafe { (at(i) as *const u64).read_volatile() }
-        };
+        let memory = [const { AtomicU64::new(0) }; 3];
+        let at = |i: usize| memory[i].as_ptr() as u64;
         for _ in 0..2 {
-            // SAFETY: inside the array.
-            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+            for word in &memory {
+                word.store(0, Ordering::Relaxed);
+            }
             state::stencil_ref(list, 3);
             // No work yet: not cut.
-            wait_value(list, at(0), 7, 0);
+            wait_value(list, at(2), 7, 1);
             assert_eq!(submitted(list).len(), 1);
             host_list(list).unwrap().count_work();
             write64(list, at(0), 1, 0, 0);
@@ -2097,14 +2097,19 @@ mod tests {
             assert_eq!(submitted(list).len(), 2);
             assert_eq!(close(list), S_OK);
             let parts = submitted(list);
-            assert!(parts[0].unmet().is_empty() && parts[1].unmet().len() == 1);
+            for (part, word) in parts.iter().zip([2, 1]) {
+                let waits = part.unmet();
+                assert_eq!(waits.len(), 1);
+                assert_eq!(waits[0].address, at(word) as usize);
+            }
+            memory[2].store(1, Ordering::Release);
+            assert!(parts[0].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[0]]);
-            assert_eq!(value(0), 1);
+            assert_eq!(memory[0].load(Ordering::Acquire), 1);
             // Reset while the second part is still to run.
             assert_eq!(reset(list, allocator, null), S_OK);
             assert_eq!(submitted(list).len(), 1);
-            // SAFETY: inside the array.
-            unsafe { (at(1) as *mut u64).write_volatile(4) };
+            memory[1].store(4, Ordering::Release);
             assert!(parts[1].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[1]]);
         }
